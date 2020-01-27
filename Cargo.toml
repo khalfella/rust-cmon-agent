@@ -10,3 +10,6 @@ edition = "2018"
 hyper = "0.13"
 tokio = { version = "0.2", features = ["full"] }
 kstat = "0.1.0"
+
+[patch.crates-io]
+mio-uds = { git = "https://github.com/papertigers/mio-uds", branch = "master"}

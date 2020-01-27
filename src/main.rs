@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 use std::io;
 use std::io::{Error, ErrorKind};
+use std::num;
 
 struct CpuKstatMetric {
     kstat_key: String,
@@ -103,11 +104,129 @@ async fn collect_gz_cpu_util_metrics() -> io::Result<String> {
     Ok(metrics_string)
 }
 
+struct ZpoolListMetric {
+    key: String,
+    units: String,
+    desc: String,
+    index: usize,
+    encoder: Box<dyn Fn(String) -> Result<f64, num::ParseFloatError> + Send + Sync>,
+}
+
+use tokio::process::Command;
+
+async fn get_zpool_metrics() -> io::Result<String> {
+    let zpool_list_metrics = vec![
+        ZpoolListMetric {
+            key: "allocated".into(),
+            units: "bytes".into(),
+            desc: "Amount of storage space used withing the pool".into(),
+            index: 1,
+            encoder: Box::new(|x| x.parse()),
+        },
+        ZpoolListMetric {
+            key: "fragmentation".into(),
+            units: "percent".into(),
+            desc: "Amount of fragmentation in the pool".into(),
+            index: 2,
+            //chop off the trailing '%' if present.
+            encoder: Box::new(|x| x.replace("%", "").parse()),
+        },
+        ZpoolListMetric {
+            key: "health".into(),
+            units: "status".into(),
+            desc: "The current health of the pool (\
+                   0 = ONLINE, 1 = DEGRADED, 2 = FAULTED, \
+                   3 = OFFLINE, 4 = REMOVED, 5 = UNAVAIL, \
+                   -1 = UNKNOWN)"
+                .into(),
+            index: 3,
+            encoder: Box::new(|x| {
+                Ok(match x.as_str() {
+                    "ONLINE" => 0.0,
+                    "DEGRADED" => 1.0,
+                    "FAULTED" => 2.0,
+                    "OFFLINE" => 3.0,
+                    "REMOVED" => 4.0,
+                    "UNAVAIL" => 5.0,
+                    _ => -1.0,
+                })
+            }),
+        },
+        ZpoolListMetric {
+            key: "size".into(),
+            units: "bytes".into(),
+            desc: "Zpool size in bytes".into(),
+            index: 4,
+            encoder: Box::new(|x| x.parse()),
+        },
+    ];
+
+    // Setting kill_on_drop to kill zpool process in case we hit a timeout
+    let zpool_process = Command::new("zpool")
+        .args(&["list", "-Hpo", "name,allocated,fragmentation,health,size"])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+
+    let outputs_fut = zpool_process.wait_with_output();
+
+    use tokio::time;
+    // XXX: Timeout is set to 5 seconds. This needs to be changed.
+    let timeout = time::timeout(time::Duration::from_millis(5000), outputs_fut);
+    let outputs_res = timeout.await?; // Handle timeout
+    let outputs = outputs_res?; // Fetched outputs successfully
+
+    if !outputs.status.success() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "zpool list  exit code is not 0",
+        ));
+    }
+
+    let stdout: String = String::from_utf8_lossy(&outputs.stdout).into();
+
+    let mut metrics = "".to_string();
+
+    for metric in zpool_list_metrics {
+        let metric_name = format!("zpool_{}_{}", metric.key, metric.units);
+        let metric_header = format!(
+            "# HELP {} {}\n# TYPE {} gauge\n",
+            metric_name, metric.desc, metric_name
+        );
+
+        let mut metric_values = "".to_string();
+
+        for line in stdout.lines() {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 5 {
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid value......"));
+            }
+
+            let value = (metric.encoder)(fields[metric.index].to_string())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid value......"))?;
+            metric_values += &format!("{}{{pool=\"{}\"}} {}\n", metric_name, fields[0], value);
+        }
+
+        metrics.push_str(&metric_header);
+        metrics.push_str(&metric_values);
+    }
+
+    println!("{}", metrics);
+
+    Ok(metrics)
+}
+
 async fn get_metrics(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
     let cpu_metrics = collect_gz_cpu_util_metrics()
         .await
         .expect("failed to read kstats");
-    Ok(Response::new(cpu_metrics.into()))
+
+    let zpool_metrics = get_zpool_metrics()
+        .await
+        .expect("failed to get zpool metrics");
+
+    let metrics = cpu_metrics + &zpool_metrics;
+    Ok(Response::new(metrics.into()))
 }
 
 #[tokio::main]
